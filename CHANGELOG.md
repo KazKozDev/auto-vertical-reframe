@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+- `movie` preset: locked camera with one static crop per shot and hard cuts.
+- `--start` / `--duration` to reframe only a window of the source.
+- `--fast`, `--imgsz`, `--analyze-stride`, `--face-stride`, `--device`, and `--saliency-model off`.
+- `--no-two-person-framing` to switch off two-person framing in presets that enable it.
+
+### Changed
+- `sports` preset follows the ball and the nearest player, with a dead zone, motion lead, and two-person framing on by default; `max_zoom` and step limits are lower.
+- Follow presets hard-cut to the subject on scene changes instead of easing from frame center.
+
 ## [0.1.0] - 2026-04-19
 
 ### Added

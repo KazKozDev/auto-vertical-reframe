@@ -10,7 +10,7 @@ Scene-aware vertical auto-reframe CLI that turns horizontal footage into 9:16 vi
 
 - Tracks people, pets, and vehicles through scene cuts with YOLOv11 segmentation and ByteTrack.
 - Face-, pose-, and saliency-aware framing with a subject ranking model and smoothed camera path.
-- Four tuned presets (`talking_head`, `sports`, `pets`, `cars`) with sensible zoom and motion limits.
+- Five tuned presets (`talking_head`, `sports`, `pets`, `cars`, `movie`) with sensible zoom and motion limits. `movie` locks one static crop per shot and hard-cuts between them instead of panning.
 - Fast `handcrafted` saliency by default, with optional slow/experimental `deepgazemr` model saliency.
 - One-click macOS launcher (`run_verthor.command`) with native dialogs for video, preset, saliency mode, and debug preview.
 
@@ -118,6 +118,12 @@ verthor clip.mp4 clip_vertical.mp4 --saliency-model deepgazemr
 Sports footage with wider framing and debug preview:
 ```bash
 verthor match.mp4 match_vertical.mp4 --preset sports --save-debug-preview
+```
+
+Process only part of a long source (30 seconds from the start, or a window):
+```bash
+verthor clip.mp4 clip_vertical.mp4 --preset movie --duration 30
+verthor clip.mp4 clip_vertical.mp4 --preset movie --start 45 --duration 30
 ```
 
 See `verthor --help` for the full flag list (saliency backend/device, motion damping, zoom bounds, ffmpeg encoder, etc.).

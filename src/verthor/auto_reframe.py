@@ -8,8 +8,8 @@ import math
 import shutil
 import subprocess
 import tempfile
-from collections import deque
-from dataclasses import dataclass
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -51,7 +51,11 @@ CLASS_IDS = {
     "truck": 7,
     "cat": 15,
     "dog": 16,
+    "sports ball": 32,
 }
+
+BALL_CLASS_NAMES = {"sports ball"}
+VEHICLE_CLASS_NAMES = {"car", "bicycle", "motorcycle", "bus", "truck"}
 
 PRESETS = {
     "talking_head": {
@@ -60,13 +64,23 @@ PRESETS = {
         "max_zoom": 1.85,
         "max_step_x": 7.0,
         "max_step_y": 5.0,
+        "camera_mode": "follow",
     },
     "sports": {
-        "classes": ["person", "car", "bicycle", "motorcycle"],
+        "classes": ["person", "sports ball", "car", "bicycle", "motorcycle"],
         "min_zoom": 1.00,
-        "max_zoom": 1.35,
-        "max_step_x": 12.0,
-        "max_step_y": 8.0,
+        "max_zoom": 1.15,
+        "max_step_x": 8.0,
+        "max_step_y": 5.0,
+        "camera_mode": "follow",
+        "min_subject_hold_frames": 28,
+        "switch_score_threshold": 1.45,
+        "two_person_framing": True,
+        "two_person_threshold": 0.68,
+        "follow_deadzone_px": 28.0,
+        "motion_lead_x": 1.7,
+        "motion_lead_y": 0.7,
+        "sports_action": True,
     },
     "pets": {
         "classes": ["dog", "cat", "person"],
@@ -74,6 +88,7 @@ PRESETS = {
         "max_zoom": 1.55,
         "max_step_x": 10.0,
         "max_step_y": 7.0,
+        "camera_mode": "follow",
     },
     "cars": {
         "classes": ["car", "truck", "bus", "motorcycle", "person"],
@@ -81,6 +96,20 @@ PRESETS = {
         "max_zoom": 1.30,
         "max_step_x": 11.0,
         "max_step_y": 7.0,
+        "camera_mode": "follow",
+    },
+    "movie": {
+        "classes": ["person"],
+        "min_zoom": 1.00,
+        "max_zoom": 1.00,
+        "max_step_x": 3.0,
+        "max_step_y": 2.0,
+        "camera_mode": "locked",
+        "min_subject_hold_frames": 36,
+        "switch_score_threshold": 1.45,
+        "imgsz": 512,
+        "analyze_stride": 2,
+        "face_stride": 2,
     },
 }
 
@@ -155,6 +184,66 @@ class CameraState:
     last_subject_key: Optional[tuple[Optional[int], int]] = None
     framing_vx: float = 0.0
     framing_vy: float = 0.0
+    force_hard_cut: bool = False
+
+
+CENTER_SEAT = -2
+
+
+@dataclass
+class PersonHit:
+    cx: float
+    half_size: float
+    has_face: bool
+    score: float
+    box_width: float = 0.0
+    box_height: float = 0.0
+
+
+@dataclass
+class FrameIntent:
+    scene_index: int
+    subject_key: Optional[tuple[Optional[int], Optional[int]]]
+    center_x: Optional[float]
+    half_size: float = 0.0
+    detections: list[PersonHit] = field(default_factory=list)
+
+
+@dataclass
+class LockedCameraFrame:
+    center_x: float
+    center_y: float
+    zoom: float
+    shot_id: int
+    cut: bool
+    kind: str = "single"
+
+
+class DisabledSaliencyHelper:
+    def __init__(self) -> None:
+        self.backend_name = "off"
+        self.active_backend = "off"
+        self.frames_total = 0
+        self.frames_backend = 0
+        self.frames_fallback = 0
+
+    def compute_map(self, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
+        self.frames_total += 1
+        return None
+
+    def reset_temporal_state(self) -> None:
+        return
+
+    def get_telemetry(self) -> dict[str, Any]:
+        return {
+            "requested_backend": "off",
+            "active_backend": "off",
+            "frames_total": self.frames_total,
+            "frames_backend": 0,
+            "frames_fallback": 0,
+            "model_loaded": False,
+            "device": None,
+        }
 
 
 class HandcraftedSaliencyHelper:
@@ -405,6 +494,8 @@ class DeepGazeMRSaliencyHelper:
 
 
 def build_saliency_helper(args: argparse.Namespace) -> Any:
+    if getattr(args, "skip_saliency", False) or args.saliency_model == "off":
+        return DisabledSaliencyHelper()
     if args.saliency_model == "handcrafted":
         return HandcraftedSaliencyHelper()
     if args.saliency_model == "deepgazemr":
@@ -430,6 +521,7 @@ class SubjectRankingModel:
             "motorcycle": 0.02,
             "bus": 0.01,
             "truck": 0.01,
+            "sports ball": 0.0,
         }
         self.feature_weights = {
             "det_conf": 1.35,
@@ -490,14 +582,31 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Scene-aware vertical auto-reframe with segmentation, presets, "
-            "and two-person framing."
+            "follow-cam sports mode, and Polarcut-style locked movie framing."
         )
     )
     parser.add_argument("input")
     parser.add_argument("output")
+    parser.add_argument(
+        "--start",
+        type=float,
+        default=0.0,
+        help="Start time in seconds (skip this much of the source).",
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="Only reframe this many seconds (from --start, or from 0).",
+    )
 
     parser.add_argument("--seg-model", default="yolo11n-seg.pt")
     parser.add_argument("--tracker", default="bytetrack.yaml")
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="YOLO inference device (cpu, mps, 0, ...). Default: auto-select.",
+    )
     parser.add_argument("--conf", type=float, default=0.30)
 
     parser.add_argument(
@@ -517,8 +626,96 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zoom-response", type=float, default=0.08)
     parser.add_argument("--zoom-damping", type=float, default=0.85)
     parser.add_argument("--max-missed-frames", type=int, default=40)
-    parser.add_argument("--min-subject-hold-frames", type=int, default=12)
-    parser.add_argument("--switch-score-threshold", type=float, default=1.20)
+    parser.add_argument("--min-subject-hold-frames", type=int, default=None)
+    parser.add_argument("--switch-score-threshold", type=float, default=None)
+    parser.add_argument(
+        "--camera-mode",
+        choices=["follow", "locked"],
+        default=None,
+        help=(
+            "follow = live tracking pan (sports). "
+            "locked = static per-shot crop with hard cuts (movie). "
+            "Defaults from the preset."
+        ),
+    )
+    parser.add_argument(
+        "--deadzone-px",
+        type=float,
+        default=40.0,
+        help="Locked mode: ignore subject drift smaller than this (pixels).",
+    )
+    parser.add_argument(
+        "--cut-threshold-px",
+        type=float,
+        default=50.0,
+        help="Locked mode: subject jump larger than this becomes a hard cut.",
+    )
+    parser.add_argument(
+        "--merge-px",
+        type=float,
+        default=50.0,
+        help="Locked mode: merge adjacent shots whose crop centers are this close.",
+    )
+    parser.add_argument(
+        "--min-shot-sec",
+        type=float,
+        default=1.5,
+        help="Locked mode: hold a subject at least this long before switching.",
+    )
+    parser.add_argument(
+        "--pan-sec",
+        type=float,
+        default=0.5,
+        help="Locked mode: ease duration for small same-area repositions.",
+    )
+    parser.add_argument(
+        "--hold-smooth-sec",
+        type=float,
+        default=0.18,
+        help="Locked mode: tiny settle time toward a locked shot center.",
+    )
+    parser.add_argument(
+        "--seat-cluster-frac",
+        type=float,
+        default=0.30,
+        help="Locked mode: merge detections into one seat if closer than this × crop width.",
+    )
+    parser.add_argument(
+        "--presence-near-frac",
+        type=float,
+        default=0.40,
+        help="Locked mode: a person counts as occupying a seat within this × crop width.",
+    )
+    parser.add_argument(
+        "--hold-near-frac",
+        type=float,
+        default=0.22,
+        help="Locked mode: keep the previous person only while they stay this close.",
+    )
+    parser.add_argument(
+        "--two-shot-fit-frac",
+        type=float,
+        default=0.70,
+        help="Locked mode: frame two people only if their span fits this × crop width.",
+    )
+    parser.add_argument(
+        "--wide-person-frac",
+        type=float,
+        default=0.22,
+        help=(
+            "Locked mode: if the largest person is narrower than this × frame "
+            "width, treat the shot as a wide/title card and lock to center."
+        ),
+    )
+    parser.add_argument(
+        "--wide-person-height-frac",
+        type=float,
+        default=0.50,
+        help=(
+            "Locked mode: the wide/title-card rule only applies if the tallest "
+            "person is also shorter than this × frame height."
+        ),
+    )
 
     parser.add_argument("--max-step-x", type=float, default=None)
     parser.add_argument("--max-step-y", type=float, default=None)
@@ -528,13 +725,46 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--lock-first-subject", action="store_true")
 
-    parser.add_argument("--two-person-framing", action="store_true")
-    parser.add_argument("--two-person-threshold", type=float, default=0.78)
+    parser.add_argument(
+        "--two-person-framing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--two-person-threshold", type=float, default=None)
+    parser.add_argument("--follow-deadzone-px", type=float, default=None)
+    parser.add_argument("--motion-lead-x", type=float, default=None)
+    parser.add_argument("--motion-lead-y", type=float, default=None)
 
     parser.add_argument(
+        "--fast",
+        action="store_true",
+        help=(
+            "Faster analysis: smaller YOLO input, skip pose/saliency/masks, "
+            "and in movie mode analyze every other frame."
+        ),
+    )
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=None,
+        help="YOLO inference size. Movie defaults to 512; others 640.",
+    )
+    parser.add_argument(
+        "--analyze-stride",
+        type=int,
+        default=None,
+        help="Locked mode: run detection every N source frames (2 = ~2x faster).",
+    )
+    parser.add_argument(
+        "--face-stride",
+        type=int,
+        default=None,
+        help="Run face detection every N analyzed frames; reuse the last face.",
+    )
+    parser.add_argument(
         "--saliency-model",
-        choices=["auto", "deepgazemr", "handcrafted"],
-        default="handcrafted",
+        choices=["auto", "deepgazemr", "handcrafted", "off"],
+        default=None,
     )
     parser.add_argument(
         "--saliency-device",
@@ -599,6 +829,56 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
         if getattr(args, key) is None:
             setattr(args, key, preset[key])
 
+    if args.camera_mode is None:
+        args.camera_mode = str(preset.get("camera_mode", "follow"))
+    if args.min_subject_hold_frames is None:
+        args.min_subject_hold_frames = int(
+            preset.get("min_subject_hold_frames", 12)
+        )
+    if args.switch_score_threshold is None:
+        args.switch_score_threshold = float(
+            preset.get("switch_score_threshold", 1.20)
+        )
+    if args.two_person_threshold is None:
+        args.two_person_threshold = float(
+            preset.get("two_person_threshold", 0.78)
+        )
+    if args.two_person_framing is None:
+        args.two_person_framing = bool(preset.get("two_person_framing", False))
+    if args.follow_deadzone_px is None:
+        args.follow_deadzone_px = float(preset.get("follow_deadzone_px", 0.0))
+    if args.motion_lead_x is None:
+        args.motion_lead_x = float(preset.get("motion_lead_x", 0.8))
+    if args.motion_lead_y is None:
+        args.motion_lead_y = float(preset.get("motion_lead_y", 0.45))
+    args.sports_action = bool(preset.get("sports_action", False))
+    if args.imgsz is None:
+        args.imgsz = int(preset.get("imgsz", 640))
+    if args.analyze_stride is None:
+        args.analyze_stride = int(preset.get("analyze_stride", 1))
+    if args.face_stride is None:
+        args.face_stride = int(preset.get("face_stride", 1))
+    if args.saliency_model is None:
+        args.saliency_model = (
+            "off"
+            if args.camera_mode == "locked" or args.fast
+            else "handcrafted"
+        )
+
+    if args.fast:
+        args.imgsz = min(int(args.imgsz), 512)
+        if args.camera_mode == "locked":
+            args.analyze_stride = max(int(args.analyze_stride), 2)
+            args.face_stride = max(int(args.face_stride), 2)
+
+    args.analyze_stride = max(1, int(args.analyze_stride))
+    args.face_stride = max(1, int(args.face_stride))
+    args.skip_saliency = args.saliency_model == "off"
+    args.skip_pose = args.camera_mode == "locked" or args.fast
+    args.retina_masks = args.camera_mode != "locked" and not args.fast
+    if args.camera_mode == "locked" and args.seg_model == "yolo11n-seg.pt":
+        args.seg_model = "yolo11n.pt"
+
     return args
 
 
@@ -660,7 +940,14 @@ def get_track_id(box: Any) -> Optional[int]:
 
 
 class MediaPipeFaceHelper:
-    def __init__(self, min_detection_confidence: float = 0.45):
+    def __init__(
+        self,
+        min_detection_confidence: float = 0.45,
+        stride: int = 1,
+    ):
+        self.stride = max(1, stride)
+        self._cache: dict[int, Optional[tuple[int, int, int, int]]] = {}
+        self._cache_age: dict[int, int] = {}
         self.detector = None
         if mp_face_detection is None:
             logging.warning(
@@ -685,9 +972,19 @@ class MediaPipeFaceHelper:
         self,
         frame_bgr: np.ndarray,
         person_box: tuple[int, int, int, int],
+        track_id: Optional[int] = None,
+        frame_idx: int = 1,
     ) -> Optional[tuple[int, int, int, int]]:
         if self.detector is None:
             return None
+        if (
+            self.stride > 1
+            and track_id is not None
+            and track_id in self._cache
+            and self._cache_age.get(track_id, 0) < self.stride - 1
+        ):
+            self._cache_age[track_id] += 1
+            return self._cache[track_id]
 
         h, w = frame_bgr.shape[:2]
         x1, y1, x2, y2 = person_box
@@ -704,12 +1001,10 @@ class MediaPipeFaceHelper:
         roi = roi[:upper_h, :]
         rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
         result = self.detector.process(rgb)
-        if not result.detections:
-            return None
 
         best = None
         best_area = -1.0
-        for det in result.detections:
+        for det in result.detections or []:
             bbox = det.location_data.relative_bounding_box
             fx1 = max(0.0, bbox.xmin)
             fy1 = max(0.0, bbox.ymin)
@@ -725,7 +1020,14 @@ class MediaPipeFaceHelper:
             if area > best_area:
                 best_area = area
                 best = (x1 + px1, y1 + py1, x1 + px2, y1 + py2)
+        if track_id is not None:
+            self._cache[track_id] = best
+            self._cache_age[track_id] = 0
         return best
+
+    def reset_cache(self) -> None:
+        self._cache.clear()
+        self._cache_age.clear()
 
 
 POSE_LANDMARK_NAMES = {
@@ -1054,7 +1356,7 @@ def active_speaker_bonus(
 def build_candidates(
     result: Any,
     frame: np.ndarray,
-    saliency_map: np.ndarray,
+    saliency_map: Optional[np.ndarray],
     ranking_model: SubjectRankingModel,
     allowed_class_ids: list[int],
     class_names: dict[int, str],
@@ -1113,8 +1415,12 @@ def build_candidates(
 
             framing_cx = mask_cx
             framing_cy = mask_cy
-            salient_box = extract_saliency_region(
-                saliency_map, (int(x1), int(y1), int(x2), int(y2))
+            salient_box = (
+                extract_saliency_region(
+                    saliency_map, (int(x1), int(y1), int(x2), int(y2))
+                )
+                if saliency_map is not None
+                else None
             )
             face_box = None
             pose_data: Optional[dict] = None
@@ -1125,7 +1431,10 @@ def build_candidates(
                         frame, (int(x1), int(y1), int(x2), int(y2))
                     )
                 face_box = face_helper.detect_in_person_box(
-                    frame, (int(x1), int(y1), int(x2), int(y2))
+                    frame,
+                    (int(x1), int(y1), int(x2), int(y2)),
+                    track_id=track_id,
+                    frame_idx=frame_idx,
                 )
                 if face_box is not None:
                     fx1, fy1, fx2, fy2 = face_box
@@ -1304,6 +1613,154 @@ def choose_subject(
 
     return best
 
+
+def _is_ball(candidate: Candidate) -> bool:
+    return candidate.cls_name in BALL_CLASS_NAMES
+
+
+def _is_vehicle(candidate: Candidate) -> bool:
+    return candidate.cls_name in VEHICLE_CLASS_NAMES
+
+
+def _candidate_dist(first: Candidate, second: Candidate) -> float:
+    return math.hypot(
+        first.framing_cx - second.framing_cx,
+        first.framing_cy - second.framing_cy,
+    )
+
+
+def filter_play_candidates(candidates: list[Candidate]) -> list[Candidate]:
+    persons = [c for c in candidates if c.cls_name == "person"]
+    balls = [c for c in candidates if _is_ball(c)]
+    vehicles = [c for c in candidates if _is_vehicle(c)]
+    if persons:
+        return persons + balls
+    if vehicles:
+        return vehicles + balls
+    return balls or candidates
+
+
+def pick_ball_carrier(
+    persons: list[Candidate],
+    balls: list[Candidate],
+) -> Optional[Candidate]:
+    if not persons or not balls:
+        return None
+    ball = max(balls, key=lambda item: item.conf * max(item.area, 1.0))
+    return min(persons, key=lambda person: _candidate_dist(person, ball))
+
+
+def choose_sports_pair(
+    persons: list[Candidate],
+    ball: Optional[Candidate],
+    threshold: float,
+    crop_w: float,
+) -> Optional[tuple[Candidate, Candidate]]:
+    if len(persons) < 2:
+        return None
+    if ball is not None:
+        ordered = sorted(persons, key=lambda person: _candidate_dist(person, ball))
+    else:
+        ordered = sorted(persons, key=lambda person: person.score, reverse=True)
+    first, second = ordered[0], ordered[1]
+    if ball is None and second.score < first.score * threshold:
+        return None
+    if ball is not None:
+        far = _candidate_dist(second, ball)
+        near = _candidate_dist(first, ball)
+        if far > max(220.0, near * 2.4):
+            return None
+    span = (
+        abs(first.framing_cx - second.framing_cx)
+        + first.width * 0.5
+        + second.width * 0.5
+    )
+    if span > crop_w * 0.85:
+        return None
+    return first, second
+
+
+def choose_sports_play(
+    candidates: list[Candidate],
+    state: CameraState,
+    args: argparse.Namespace,
+    crop_w: float,
+) -> tuple[Optional[Candidate], Optional[Candidate], Optional[tuple[Candidate, Candidate]]]:
+    play = filter_play_candidates(candidates)
+    persons = [c for c in play if c.cls_name == "person"]
+    balls = [c for c in play if _is_ball(c)]
+    ball = max(balls, key=lambda item: item.conf * max(item.area, 1.0)) if balls else None
+    carrier = pick_ball_carrier(persons, balls)
+    if carrier is not None:
+        ranked = [carrier] + [c for c in persons if c is not carrier]
+    else:
+        ranked = persons or play
+    subject = choose_subject(
+        ranked,
+        state,
+        args.lock_first_subject,
+        args.min_subject_hold_frames,
+        args.switch_score_threshold,
+    )
+    pair = (
+        choose_sports_pair(persons, ball, args.two_person_threshold, crop_w)
+        if args.two_person_framing
+        else None
+    )
+    return subject, ball, pair
+
+
+def union_focus_bounds(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    return (
+        min(first[0], second[0]),
+        min(first[1], second[1]),
+        max(first[2], second[2]),
+        max(first[3], second[3]),
+    )
+
+
+def build_action_observation(
+    subject: Candidate,
+    ball: Optional[Candidate],
+    base_crop_w: int,
+    base_crop_h: int,
+    frame_w: int,
+    frame_h: int,
+    min_zoom: float,
+    max_zoom: float,
+) -> CameraObservation:
+    bounds = derive_candidate_focus_bounds(subject)
+    if ball is not None:
+        ball_bounds = (ball.x1, ball.y1, ball.x2, ball.y2)
+        union = union_focus_bounds(bounds, ball_bounds)
+        union_w = union[2] - union[0]
+        if union_w <= base_crop_w * 1.05:
+            bounds = union
+        else:
+            ball_cx = (ball.x1 + ball.x2) / 2.0
+            mid_x = (bounds[0] + bounds[2]) / 2.0
+            shift = (ball_cx - mid_x) * 0.35
+            bounds = (
+                bounds[0] + shift,
+                bounds[1],
+                bounds[2] + shift,
+                bounds[3],
+            )
+    return compute_observation_from_bounds(
+        bounds=bounds,
+        confidence=clamp(subject.conf * 0.7 + subject.score / 500.0, 0.25, 1.0),
+        base_crop_w=base_crop_w,
+        base_crop_h=base_crop_h,
+        frame_w=frame_w,
+        frame_h=frame_h,
+        min_zoom=min_zoom,
+        max_zoom=max_zoom,
+    )
+
+
 def advance_value_with_velocity(
     current: float,
     target: float,
@@ -1326,6 +1783,30 @@ def apply_camera_motion(
     frame_w: int,
     frame_h: int,
 ) -> tuple[int, int]:
+    if state.force_hard_cut:
+        state.crop_center_x = observation.center_x
+        state.crop_center_y = observation.center_y
+        state.target_center_x = observation.center_x
+        state.target_center_y = observation.center_y
+        state.zoom = observation.zoom
+        state.target_zoom = observation.zoom
+        state.velocity_x = 0.0
+        state.velocity_y = 0.0
+        state.zoom_velocity = 0.0
+        state.force_hard_cut = False
+        return current_crop_size(
+            base_crop_w, base_crop_h, state.zoom, frame_w, frame_h
+        )
+
+    deadzone = float(getattr(args, "follow_deadzone_px", 0.0) or 0.0)
+    if deadzone > 0:
+        if abs(observation.center_x - state.crop_center_x) <= deadzone:
+            observation.center_x = state.crop_center_x
+        if abs(observation.center_y - state.crop_center_y) <= deadzone * 0.75:
+            observation.center_y = state.crop_center_y
+        if abs(observation.zoom - state.zoom) < 0.045:
+            observation.zoom = state.zoom
+
     obs_weight = clamp(observation.confidence, 0.15, 1.0)
     obs_target_alpha = clamp(args.target_alpha * (0.55 + obs_weight * 0.65), 0.04, 0.4)
 
@@ -1397,6 +1878,734 @@ def apply_camera_motion(
         frame_h - crop_h / 2,
     )
     return crop_w, crop_h
+
+
+def _median(values: list[float]) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _smooth_damp(
+    current: float,
+    target: float,
+    velocity: float,
+    smooth_time: float,
+    dt: float,
+) -> tuple[float, float]:
+    smooth_time = max(0.0001, smooth_time)
+    omega = 2.0 / smooth_time
+    x = omega * dt
+    exp = 1.0 / (1.0 + x + 0.48 * x * x + 0.235 * x * x * x)
+    change = current - target
+    temp = (velocity + omega * change) * dt
+    velocity = (velocity - omega * temp) * exp
+    return target + (change + temp) * exp, velocity
+
+
+def _face_lock(candidate: Candidate) -> tuple[float, float, bool]:
+    if candidate.face_box is not None:
+        fx1, _fy1, fx2, _fy2 = candidate.face_box
+        return (fx1 + fx2) / 2.0, max(8.0, (fx2 - fx1) / 2.0), True
+    return candidate.framing_cx, max(12.0, candidate.width * 0.18), False
+
+
+def person_hits_from_candidates(candidates: list[Candidate]) -> list[PersonHit]:
+    hits: list[PersonHit] = []
+    for candidate in candidates:
+        if candidate.cls_name != "person":
+            continue
+        cx, half_size, has_face = _face_lock(candidate)
+        hits.append(
+            PersonHit(
+                cx=cx,
+                half_size=half_size,
+                has_face=has_face,
+                score=max(candidate.score, candidate.conf),
+                box_width=max(1.0, candidate.width),
+                box_height=max(1.0, candidate.height),
+            )
+        )
+    return hits
+
+
+def make_locked_intent(
+    scene_index: int,
+    subject: Optional[Candidate],
+    pair: Optional[tuple[Candidate, Candidate]],
+    candidates: Optional[list[Candidate]] = None,
+) -> FrameIntent:
+    detections = person_hits_from_candidates(candidates or [])
+    if pair is not None:
+        left_x, left_s, _ = _face_lock(pair[0])
+        right_x, right_s, _ = _face_lock(pair[1])
+        return FrameIntent(
+            scene_index=scene_index,
+            subject_key=(
+                pair[0].track_id,
+                pair[1].track_id if pair[1].track_id is not None else pair[0].cls_id,
+            ),
+            center_x=(left_x + right_x) / 2.0,
+            half_size=max(left_s, right_s),
+            detections=detections,
+        )
+    if subject is not None:
+        cx, half_size, _has_face = _face_lock(subject)
+        return FrameIntent(
+            scene_index=scene_index,
+            subject_key=(subject.track_id, subject.cls_id),
+            center_x=cx,
+            half_size=half_size,
+            detections=detections,
+        )
+    return FrameIntent(
+        scene_index=scene_index,
+        subject_key=None,
+        center_x=None,
+        detections=detections,
+    )
+
+
+def update_locked_tracking_state(
+    state: CameraState,
+    subject: Optional[Candidate],
+    pair: Optional[tuple[Candidate, Candidate]],
+    args: argparse.Namespace,
+    last_subject_key: Optional[tuple[Optional[int], int]],
+    stats: dict[str, int],
+) -> Optional[tuple[Optional[int], int]]:
+    if pair is not None:
+        stats["frames_with_two_person"] += 1
+        state.missed_frames = 0
+        state.tracked_id = None
+        state.tracked_cls_id = None
+        state.frames_since_subject_switch = 0
+        return None
+
+    if subject is None:
+        state.missed_frames += 1
+        state.tracked_id = None
+        state.tracked_cls_id = None
+        state.frames_since_subject_switch = 0
+        return last_subject_key
+
+    previous_subject_key = (state.tracked_id, state.tracked_cls_id)
+    current_subject_key = (subject.track_id, subject.cls_id)
+    if last_subject_key is not None and current_subject_key != last_subject_key:
+        stats["subject_switches"] += 1
+
+    stats["frames_with_subject"] += 1
+    if subject.face_box is not None:
+        stats["frames_with_face"] += 1
+
+    if (
+        args.lock_first_subject
+        and state.lock_track_id is None
+        and subject.track_id is not None
+    ):
+        state.lock_track_id = subject.track_id
+        state.lock_cls_id = subject.cls_id
+
+    state.tracked_id = subject.track_id
+    state.tracked_cls_id = subject.cls_id
+    state.missed_frames = 0
+    if current_subject_key == previous_subject_key:
+        state.frames_since_subject_switch += 1
+    else:
+        state.frames_since_subject_switch = 0
+    return current_subject_key
+
+
+def _cluster_1d(
+    samples: list[tuple[float, float]],
+    tol: float,
+    min_frac: float,
+) -> list[tuple[float, float]]:
+    if not samples:
+        return []
+    ordered = sorted(samples, key=lambda item: item[0])
+    groups: list[list[tuple[float, float]]] = []
+    current = [ordered[0]]
+    for sample in ordered[1:]:
+        if sample[0] - current[-1][0] > tol:
+            groups.append(current)
+            current = [sample]
+        else:
+            current.append(sample)
+    groups.append(current)
+    keep = [group for group in groups if len(group) >= min_frac * len(ordered)]
+    if not keep:
+        keep = [max(groups, key=len)]
+    clustered: list[tuple[float, float]] = []
+    for group in keep:
+        cx = _median([item[0] for item in group])
+        half_size = _median([item[1] for item in group])
+        if cx is not None:
+            clustered.append((cx, half_size or 40.0))
+    return clustered
+
+
+def _hits_at(intent: FrameIntent) -> list[PersonHit]:
+    if intent.detections:
+        return intent.detections
+    if intent.center_x is not None:
+        return [
+            PersonHit(
+                cx=intent.center_x,
+                half_size=intent.half_size or 40.0,
+                has_face=False,
+                score=1.0,
+                box_width=max(intent.half_size * 6.0, 400.0),
+            )
+        ]
+    return []
+
+
+def _frame_lock_mode(
+    intent: FrameIntent,
+    frame_w: int,
+    frame_h: int,
+    wide_frac: float,
+    wide_height_frac: float,
+) -> str:
+    if not intent.detections and intent.center_x is None:
+        return "empty"
+    if not intent.detections:
+        return "person"
+    widest = max((hit.box_width for hit in intent.detections), default=0.0)
+    if widest <= 0:
+        return "person"
+    tallest = max((hit.box_height for hit in intent.detections), default=0.0)
+    if widest < frame_w * wide_frac and tallest < frame_h * wide_height_frac:
+        return "wide"
+    return "person"
+
+
+def _scene_windows(intents: list[FrameIntent]) -> tuple[list[int], list[int]]:
+    count = len(intents)
+    scene_lo = [0] * count
+    for idx in range(1, count):
+        scene_lo[idx] = (
+            idx
+            if intents[idx].scene_index != intents[idx - 1].scene_index
+            else scene_lo[idx - 1]
+        )
+    scene_hi = [count] * count
+    for idx in range(count - 2, -1, -1):
+        scene_hi[idx] = (
+            idx + 1
+            if intents[idx].scene_index != intents[idx + 1].scene_index
+            else scene_hi[idx + 1]
+        )
+    return scene_lo, scene_hi
+
+
+def _build_scene_seats(
+    intents: list[FrameIntent],
+    crop_w: float,
+    cluster_frac: float,
+) -> list[tuple[int, float, float]]:
+    by_scene: dict[int, list[tuple[float, float]]] = defaultdict(list)
+    face_counts: dict[int, int] = defaultdict(int)
+    for intent in intents:
+        for hit in _hits_at(intent):
+            if hit.has_face:
+                by_scene[intent.scene_index].append((hit.cx, hit.half_size))
+                face_counts[intent.scene_index] += 1
+    for intent in intents:
+        if face_counts[intent.scene_index] >= 8:
+            continue
+        for hit in _hits_at(intent):
+            if not hit.has_face:
+                by_scene[intent.scene_index].append((hit.cx, hit.half_size))
+
+    seats: list[tuple[int, float, float]] = []
+    tol = max(16.0, crop_w * cluster_frac)
+    for scene_index, samples in by_scene.items():
+        for cx, half_size in _cluster_1d(samples, tol, 0.25):
+            seats.append((scene_index, cx, half_size))
+    return seats
+
+
+def _nearest_seat(
+    cx: float,
+    scene_index: int,
+    seats: list[tuple[int, float, float]],
+    max_px: float,
+) -> Optional[int]:
+    candidates = [
+        idx
+        for idx, (scene, seat_x, _sz) in enumerate(seats)
+        if scene == scene_index and abs(seat_x - cx) <= max_px
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda idx: abs(seats[idx][1] - cx))
+
+
+def _synthetic_seat(scene_index: int, cx: float, tol: float) -> int:
+    return -1 - (scene_index * 10000 + int(round(cx / max(tol, 1.0))))
+
+
+def plan_locked_camera_path(
+    intents: list[FrameIntent],
+    fps: float,
+    frame_w: int,
+    frame_h: int,
+    base_crop_w: int,
+    base_crop_h: int,
+    args: argparse.Namespace,
+) -> tuple[list[LockedCameraFrame], dict[str, int]]:
+    if not intents:
+        return [], {"shots": 0, "cuts": 0, "seats": 0, "two_shots": 0}
+
+    crop_w, _crop_h = current_crop_size(
+        base_crop_w, base_crop_h, args.min_zoom, frame_w, frame_h
+    )
+    cluster_frac = float(getattr(args, "seat_cluster_frac", 0.30))
+    presence_near = crop_w * float(getattr(args, "presence_near_frac", 0.40))
+    hold_near = crop_w * float(getattr(args, "hold_near_frac", 0.22))
+    two_shot_fit = crop_w * float(getattr(args, "two_shot_fit_frac", 0.70))
+    wide_frac = float(getattr(args, "wide_person_frac", 0.22))
+    wide_height_frac = float(getattr(args, "wide_person_height_frac", 0.50))
+    win = max(0, int(round(0.2 * fps)))
+    cluster_tol = max(16.0, crop_w * cluster_frac)
+    seats = _build_scene_seats(intents, float(crop_w), cluster_frac)
+    scene_lo, scene_hi = _scene_windows(intents)
+    n = len(intents)
+
+    def present_at(frame_idx: int, cx: float, radius: float) -> bool:
+        start = max(scene_lo[frame_idx], frame_idx - win)
+        end = min(scene_hi[frame_idx], frame_idx + win + 1)
+        for other in range(start, end):
+            for hit in _hits_at(intents[other]):
+                if abs(hit.cx - cx) <= radius:
+                    return True
+        return False
+
+    def nearest_hit(frame_idx: int, cx: float, radius: float) -> Optional[PersonHit]:
+        start = max(scene_lo[frame_idx], frame_idx - win)
+        end = min(scene_hi[frame_idx], frame_idx + win + 1)
+        best: Optional[PersonHit] = None
+        best_dist = radius + 1.0
+        for other in range(start, end):
+            for hit in _hits_at(intents[other]):
+                dist = abs(hit.cx - cx)
+                if dist <= radius and dist < best_dist:
+                    best = hit
+                    best_dist = dist
+        return best
+
+    seat_of: list[Optional[int]] = [None] * n
+    last_seat: Optional[int] = None
+    last_cx: Optional[float] = None
+    for idx, intent in enumerate(intents):
+        if idx > 0 and intent.scene_index != intents[idx - 1].scene_index:
+            last_seat = None
+            last_cx = None
+
+        assigned: Optional[int] = None
+        lock_mode = _frame_lock_mode(
+            intent, frame_w, frame_h, wide_frac, wide_height_frac
+        )
+        if lock_mode in {"empty", "wide"}:
+            assigned = CENTER_SEAT
+        elif intent.center_x is not None:
+            assigned = _nearest_seat(
+                intent.center_x, intent.scene_index, seats, presence_near
+            )
+            if assigned is None:
+                assigned = _nearest_seat(
+                    intent.center_x, intent.scene_index, seats, float(crop_w)
+                )
+            if assigned is None:
+                assigned = _synthetic_seat(
+                    intent.scene_index, intent.center_x, cluster_tol
+                )
+        elif last_cx is not None and nearest_hit(idx, last_cx, hold_near) is not None:
+            assigned = last_seat
+        else:
+            occupied = [
+                seat_idx
+                for seat_idx, (scene, seat_x, _sz) in enumerate(seats)
+                if scene == intent.scene_index and present_at(idx, seat_x, presence_near)
+            ]
+            if occupied:
+                assigned = min(
+                    occupied, key=lambda seat_idx: abs(seats[seat_idx][1] - frame_w / 2)
+                )
+            else:
+                hits = _hits_at(intent)
+                if hits:
+                    central = min(hits, key=lambda hit: abs(hit.cx - frame_w / 2))
+                    assigned = _nearest_seat(
+                        central.cx, intent.scene_index, seats, presence_near
+                    )
+                    if assigned is None:
+                        assigned = _synthetic_seat(
+                            intent.scene_index, central.cx, cluster_tol
+                        )
+
+        if assigned is not None and assigned >= 0:
+            seat_x = seats[assigned][1]
+            if not present_at(idx, seat_x, presence_near):
+                fallback = [
+                    seat_idx
+                    for seat_idx, (scene, other_x, _sz) in enumerate(seats)
+                    if scene == intent.scene_index
+                    and present_at(idx, other_x, presence_near)
+                ]
+                if fallback:
+                    assigned = min(
+                        fallback,
+                        key=lambda seat_idx: abs(seats[seat_idx][1] - frame_w / 2),
+                    )
+                else:
+                    hits = _hits_at(intent)
+                    assigned = (
+                        _synthetic_seat(
+                            intent.scene_index,
+                            min(hits, key=lambda hit: abs(hit.cx - frame_w / 2)).cx,
+                            cluster_tol,
+                        )
+                        if hits
+                        else None
+                    )
+
+        seat_of[idx] = assigned
+        if assigned == CENTER_SEAT:
+            last_seat = CENTER_SEAT
+            last_cx = frame_w / 2.0
+        elif assigned is not None and assigned >= 0:
+            last_seat = assigned
+            last_cx = seats[assigned][1]
+        elif intent.center_x is not None:
+            last_seat = assigned
+            last_cx = intent.center_x
+        elif assigned is None:
+            last_seat = None
+            last_cx = None
+
+    for idx, assigned in enumerate(seat_of):
+        if assigned is None or assigned >= 0 or assigned == CENTER_SEAT:
+            continue
+        scene_seats = [
+            seat_idx
+            for seat_idx, (scene, _x, _sz) in enumerate(seats)
+            if scene == intents[idx].scene_index
+        ]
+        if not scene_seats:
+            continue
+        snap_x = intents[idx].center_x
+        if snap_x is None:
+            snap_x = seats[scene_seats[0]][1]
+        seat_of[idx] = min(
+            scene_seats, key=lambda seat_idx: abs(seats[seat_idx][1] - snap_x)
+        )
+
+    min_len = max(1, int(round(args.min_shot_sec * fps)))
+    segments: list[tuple[int, int]] = []
+    start = 0
+    for idx in range(1, n + 1):
+        if idx == n or (
+            intents[idx].scene_index,
+            seat_of[idx],
+        ) != (
+            intents[start].scene_index,
+            seat_of[start],
+        ):
+            segments.append((start, idx))
+            start = idx
+
+    for seg_idx, (seg_start, seg_end) in enumerate(segments):
+        if (seg_end - seg_start) >= min_len:
+            continue
+        if seg_idx == 0:
+            if (
+                len(segments) > 1
+                and intents[seg_end].scene_index == intents[seg_start].scene_index
+            ):
+                next_seat = seat_of[seg_end]
+                for frame_i in range(seg_start, seg_end):
+                    seat_of[frame_i] = next_seat
+            continue
+        if intents[seg_start].scene_index != intents[seg_start - 1].scene_index:
+            continue
+        prev_seat = seat_of[seg_start - 1]
+        for frame_i in range(seg_start, seg_end):
+            seat_of[frame_i] = prev_seat
+
+    shot_ids = [0] * n
+    shot_id = 0
+    for idx in range(1, n):
+        if (
+            intents[idx].scene_index != intents[idx - 1].scene_index
+            or seat_of[idx] != seat_of[idx - 1]
+        ):
+            shot_id += 1
+        shot_ids[idx] = shot_id
+
+    shot_count = shot_id + 1
+    shot_lock_x: list[Optional[float]] = [None] * shot_count
+    shot_scene = [intents[0].scene_index] * shot_count
+    shot_kind = ["single"] * shot_count
+    two_shots = 0
+
+    ranges: list[tuple[int, int]] = []
+    range_start = 0
+    for idx in range(1, n + 1):
+        if idx == n or shot_ids[idx] != shot_ids[range_start]:
+            ranges.append((range_start, idx))
+            range_start = idx
+
+    logging.debug(
+        "Locked seat runs: %s",
+        [
+            {
+                "start": seg_start + 1,
+                "end": seg_end,
+                "scene": intents[seg_start].scene_index,
+                "seat": seat_of[seg_start],
+                "n": seg_end - seg_start,
+            }
+            for seg_start, seg_end in ranges
+        ],
+    )
+    for sid, (seg_start, seg_end) in enumerate(ranges):
+        shot_scene[sid] = intents[seg_start].scene_index
+        primary_seat = seat_of[seg_start]
+        if primary_seat == CENTER_SEAT:
+            shot_lock_x[sid] = frame_w / 2.0
+            shot_kind[sid] = "center"
+            continue
+        samples: list[float] = []
+        sizes: list[float] = []
+        for frame_i in range(seg_start, seg_end):
+            if intents[frame_i].center_x is not None:
+                samples.append(intents[frame_i].center_x)
+                sizes.append(intents[frame_i].half_size or 40.0)
+            elif primary_seat is not None and primary_seat >= 0:
+                samples.append(seats[primary_seat][1])
+                sizes.append(seats[primary_seat][2])
+        lock_x = _median(samples)
+        lock_size = _median(sizes) or 40.0
+        if lock_x is None and primary_seat is not None and primary_seat >= 0:
+            lock_x = seats[primary_seat][1]
+            lock_size = seats[primary_seat][2]
+
+        shot_len = max(1, seg_end - seg_start)
+        scene_seat_ids = [
+            seat_idx
+            for seat_idx, (scene, _x, _sz) in enumerate(seats)
+            if scene == shot_scene[sid]
+        ]
+        if lock_x is not None and len(scene_seat_ids) >= 2:
+            best_partner = None
+            best_presence = 0.0
+            for seat_idx in scene_seat_ids:
+                if primary_seat is not None and seat_idx == primary_seat:
+                    continue
+                if abs(seats[seat_idx][1] - lock_x) <= hold_near:
+                    continue
+                present_frames = sum(
+                    1
+                    for frame_i in range(seg_start, seg_end)
+                    if present_at(frame_i, seats[seat_idx][1], presence_near)
+                )
+                presence = present_frames / shot_len
+                if presence >= 0.50 and presence > best_presence:
+                    best_partner = seat_idx
+                    best_presence = presence
+            if best_partner is not None:
+                partner_x, partner_sz = seats[best_partner][1], seats[best_partner][2]
+                extent = (
+                    max(lock_x + lock_size, partner_x + partner_sz)
+                    - min(lock_x - lock_size, partner_x - partner_sz)
+                )
+                if extent <= two_shot_fit:
+                    lock_x = (lock_x + partner_x) / 2.0
+                    shot_kind[sid] = "two_shot"
+                    two_shots += 1
+
+        if (
+            lock_x is not None
+            and shot_kind[sid] != "two_shot"
+            and not present_at(seg_start, lock_x, presence_near)
+        ):
+            occupied_x = [
+                seats[seat_idx][1]
+                for seat_idx, (scene, seat_x, _sz) in enumerate(seats)
+                if scene == shot_scene[sid]
+                and present_at(seg_start, seat_x, presence_near)
+            ]
+            if occupied_x:
+                lock_x = min(occupied_x, key=lambda cx: abs(cx - frame_w / 2))
+
+        shot_lock_x[sid] = lock_x
+
+    prev_lock: Optional[float] = None
+    for sid in range(shot_count):
+        if shot_lock_x[sid] is None:
+            shot_lock_x[sid] = prev_lock
+        else:
+            prev_lock = shot_lock_x[sid]
+    first_lock = next((x for x in shot_lock_x if x is not None), frame_w / 2.0)
+    shot_lock_x = [first_lock if x is None else x for x in shot_lock_x]
+
+    super_ids = [0] * shot_count
+    super_id = 0
+    for sid in range(1, shot_count):
+        same_scene = shot_scene[sid] == shot_scene[sid - 1]
+        close = abs(shot_lock_x[sid] - shot_lock_x[sid - 1]) < args.merge_px
+        if same_scene and close:
+            shot_lock_x[sid] = shot_lock_x[sid - 1]
+            shot_kind[sid] = shot_kind[sid - 1]
+        else:
+            super_id += 1
+        super_ids[sid] = super_id
+
+    center_y = frame_h / 2.0
+    half_w = crop_w / 2.0
+    dt = 1.0 / max(fps, 1.0)
+    cam_x = clamp(shot_lock_x[shot_ids[0]], half_w, frame_w - half_w)
+    vel_x = 0.0
+    prev_super = super_ids[shot_ids[0]]
+    prev_scene = intents[0].scene_index
+    cuts = 0
+    path: list[LockedCameraFrame] = []
+
+    for idx, intent in enumerate(intents):
+        sid = shot_ids[idx]
+        super_shot = super_ids[sid]
+        goal = clamp(shot_lock_x[sid], half_w, frame_w - half_w)
+        if abs(goal - cam_x) <= args.deadzone_px:
+            goal = cam_x
+        subject_changed = super_shot != prev_super
+        scene_changed = intent.scene_index != prev_scene
+        big_jump = abs(goal - cam_x) > args.cut_threshold_px
+        did_cut = False
+
+        if (subject_changed or scene_changed) and (big_jump or scene_changed):
+            cam_x, vel_x = goal, 0.0
+            cuts += 1
+            did_cut = True
+        else:
+            smooth_time = args.pan_sec if subject_changed else args.hold_smooth_sec
+            cam_x, vel_x = _smooth_damp(cam_x, goal, vel_x, smooth_time, dt)
+
+        cam_x = clamp(cam_x, half_w, frame_w - half_w)
+        path.append(
+            LockedCameraFrame(
+                center_x=cam_x,
+                center_y=center_y,
+                zoom=args.min_zoom,
+                shot_id=super_shot,
+                cut=did_cut,
+                kind=shot_kind[sid],
+            )
+        )
+        prev_super = super_shot
+        prev_scene = intent.scene_index
+
+    return path, {
+        "shots": super_id + 1,
+        "cuts": cuts,
+        "seats": len(seats),
+        "two_shots": two_shots,
+    }
+
+
+def render_locked_frames(
+    input_path: Path,
+    planned: list[LockedCameraFrame],
+    writer: cv2.VideoWriter,
+    debug_writer: Optional[cv2.VideoWriter],
+    args: argparse.Namespace,
+    base_crop_w: int,
+    base_crop_h: int,
+    frame_w: int,
+    frame_h: int,
+    total_frames: int,
+    stats: dict[str, int],
+) -> None:
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not reopen input video: {input_path}")
+
+    frame_idx = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        sample = planned[min(frame_idx, len(planned) - 1)]
+        crop_w, crop_h = current_crop_size(
+            base_crop_w, base_crop_h, sample.zoom, frame_w, frame_h
+        )
+        cropped, crop_rect = crop_frame(
+            frame, sample.center_x, sample.center_y, crop_w, crop_h
+        )
+        writer.write(
+            cv2.resize(
+                cropped,
+                (args.output_width, args.output_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        )
+        if debug_writer is not None:
+            dbg_state = CameraState(
+                crop_center_x=sample.center_x,
+                crop_center_y=sample.center_y,
+                zoom=sample.zoom,
+                target_center_x=sample.center_x,
+                target_center_y=sample.center_y,
+                target_zoom=sample.zoom,
+                current_scene_index=sample.shot_id,
+            )
+            dbg = draw_debug(
+                frame,
+                crop_rect,
+                [],
+                None,
+                None,
+                dbg_state,
+                frame_idx + 1,
+                total_frames,
+            )
+            cut_label = "CUT" if sample.cut else "HOLD"
+            cv2.putText(
+                dbg,
+                f"locked {cut_label} {sample.kind} shot={sample.shot_id}",
+                (16, 140),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            debug_writer.write(
+                cv2.resize(
+                    dbg,
+                    (args.output_width, args.output_height),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+            )
+        stats["frames_processed"] += 1
+        frame_idx += 1
+        if total_frames > 0 and frame_idx >= total_frames:
+            break
+        if frame_idx % 50 == 0:
+            logging.info(
+                "Rendered %s/%s | locked shot=%s | cut=%s",
+                frame_idx,
+                total_frames if total_frames > 0 else "?",
+                sample.shot_id,
+                sample.cut,
+            )
+    cap.release()
 
 
 def derive_candidate_focus_bounds(
@@ -1720,6 +2929,32 @@ def build_video_filters(
     return ",".join(filters)
 
 
+def extract_source_clip(
+    input_path: Path,
+    output_path: Path,
+    start: float,
+    duration: Optional[float],
+) -> None:
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg not found in PATH")
+    # Re-encode instead of stream copy: "-c copy" can only cut on keyframes,
+    # so the clip would start earlier than --start.
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+    if start > 0:
+        cmd += ["-ss", f"{start:.3f}"]
+    cmd += ["-i", str(input_path)]
+    if duration is not None:
+        cmd += ["-t", f"{duration:.3f}"]
+    cmd += [
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "12",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "256k",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr or "Failed to extract source clip")
+
+
 def run_ffmpeg_mux(
     silent_video_path: str,
     source_input_path: str,
@@ -1793,13 +3028,15 @@ def reset_for_new_scene(
     frame_w: int,
     frame_h: int,
     min_zoom: float,
+    hard_cut: bool = False,
 ) -> None:
-    state.crop_center_x = frame_w / 2
-    state.crop_center_y = frame_h / 2
-    state.zoom = min_zoom
-    state.target_center_x = frame_w / 2
-    state.target_center_y = frame_h / 2
-    state.target_zoom = min_zoom
+    if not hard_cut:
+        state.crop_center_x = frame_w / 2
+        state.crop_center_y = frame_h / 2
+        state.zoom = min_zoom
+        state.target_center_x = frame_w / 2
+        state.target_center_y = frame_h / 2
+        state.target_zoom = min_zoom
     state.velocity_x = 0.0
     state.velocity_y = 0.0
     state.zoom_velocity = 0.0
@@ -1814,11 +3051,16 @@ def reset_for_new_scene(
     state.last_subject_key = None
     state.framing_vx = 0.0
     state.framing_vy = 0.0
+    state.force_hard_cut = hard_cut
 
 
 def process_video(args: argparse.Namespace) -> None:
     input_path = Path(args.input)
     output_path = Path(args.output)
+    start = max(0.0, float(args.start or 0.0))
+    duration = args.duration
+    if duration is not None and duration <= 0:
+        raise ValueError("--duration must be greater than 0")
 
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
@@ -1830,6 +3072,13 @@ def process_video(args: argparse.Namespace) -> None:
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
 
+    max_process_frames = None
+    if duration is not None and start <= 0:
+        max_process_frames = max(1, int(round(duration * fps)))
+        if total_frames > 0:
+            max_process_frames = min(max_process_frames, total_frames)
+        total_frames = max_process_frames
+
     base_crop_w, base_crop_h = compute_base_crop(frame_w, frame_h, 9, 16)
     allowed_class_ids = [
         CLASS_IDS[name] for name in args.classes if name in CLASS_IDS
@@ -1838,22 +3087,67 @@ def process_video(args: argparse.Namespace) -> None:
         raise ValueError("No valid classes selected")
 
     speaker_segments = load_speaker_segments(args.speaker_json)
-    scene_start_frames = detect_scenes(
-        str(input_path), args.scene_threshold, args.min_scene_len
-    )
-    scene_start_set = set(scene_start_frames)
 
+    yolo_device = args.device or None
+    logging.info(
+        "Speed: model=%s imgsz=%s stride=%s face_stride=%s pose=%s "
+        "saliency=%s masks=%s device=%s",
+        args.seg_model,
+        args.imgsz,
+        args.analyze_stride if args.camera_mode == "locked" else 1,
+        args.face_stride,
+        not args.skip_pose,
+        args.saliency_model,
+        args.retina_masks,
+        yolo_device or "auto",
+    )
     model = YOLO(args.seg_model)
     class_names = model.names
-    face_helper = MediaPipeFaceHelper()
-    pose_helper = MediaPipePoseHelper()
+    face_helper = MediaPipeFaceHelper(stride=args.face_stride)
+    pose_helper = None if args.skip_pose else MediaPipePoseHelper()
     saliency_helper = build_saliency_helper(args)
     ranking_model = SubjectRankingModel()
-    if pose_helper.detector is None:
+    if pose_helper is not None and pose_helper.detector is None:
         pose_helper = None
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
+        source_path = input_path
+        if start > 0 or duration is not None:
+            source_path = tmpdir_path / "source_clip.mp4"
+            logging.info(
+                "Clipping source start=%.2fs duration=%s",
+                start,
+                f"{duration:.2f}s" if duration is not None else "end",
+            )
+            extract_source_clip(input_path, source_path, start, duration)
+            cap = cv2.VideoCapture(str(source_path))
+            if not cap.isOpened():
+                raise RuntimeError(f"Could not open clipped video: {source_path}")
+            fps = cap.get(cv2.CAP_PROP_FPS) or fps
+            frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or frame_w
+            frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or frame_h
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            base_crop_w, base_crop_h = compute_base_crop(frame_w, frame_h, 9, 16)
+            if duration is not None:
+                max_process_frames = max(1, int(round(duration * fps)))
+                if total_frames > 0:
+                    max_process_frames = min(max_process_frames, total_frames)
+                total_frames = max_process_frames
+        if duration is not None:
+            logging.info(
+                "Processing %.2fs (%s frames) from %.2fs",
+                duration,
+                total_frames,
+                start,
+            )
+
+        scene_start_frames = detect_scenes(
+            str(source_path), args.scene_threshold, args.min_scene_len
+        )
+        scene_start_set = set(scene_start_frames)
+
         silent_video_path = tmpdir_path / "silent_vertical.mp4"
         debug_video_path = tmpdir_path / "debug_vertical.mp4"
 
@@ -1904,27 +3198,51 @@ def process_video(args: argparse.Namespace) -> None:
 
         last_subject_key = None
         scene_index = 0
+        locked_intents: list[FrameIntent] = []
+        locked_plan_info = {"shots": 0, "cuts": 0, "seats": 0, "two_shots": 0}
 
+        analyze_stride = (
+            args.analyze_stride if args.camera_mode == "locked" else 1
+        )
         results = model.track(
-            source=str(input_path),
+            source=str(source_path),
             stream=True,
             persist=True,
             tracker=args.tracker,
             classes=allowed_class_ids,
             conf=args.conf,
-            retina_masks=True,
+            retina_masks=args.retina_masks,
+            imgsz=args.imgsz,
+            vid_stride=analyze_stride,
+            device=yolo_device,
             verbose=False,
         )
 
-        for frame_idx, result in enumerate(results, start=1):
+        for result_idx, result in enumerate(results, start=1):
             frame = result.orig_img
             if frame is None:
                 continue
+            frame_idx = 1 + (result_idx - 1) * analyze_stride
+            if max_process_frames is not None and frame_idx > max_process_frames:
+                break
 
-            if frame_idx in scene_start_set:
+            if frame_idx in scene_start_set or (
+                analyze_stride > 1
+                and any(
+                    frame_idx <= start < frame_idx + analyze_stride
+                    for start in scene_start_set
+                )
+            ):
                 scene_index += 1
                 state.current_scene_index = scene_index
-                reset_for_new_scene(state, frame_w, frame_h, args.min_zoom)
+                reset_for_new_scene(
+                    state,
+                    frame_w,
+                    frame_h,
+                    args.min_zoom,
+                    hard_cut=args.camera_mode == "follow",
+                )
+                face_helper.reset_cache()
                 saliency_helper.reset_temporal_state()
                 stats["scene_resets"] += 1
                 last_subject_key = None
@@ -1947,18 +3265,51 @@ def process_video(args: argparse.Namespace) -> None:
                 ),
             )
 
-            subject = choose_subject(
-                candidates,
-                state,
-                args.lock_first_subject,
-                args.min_subject_hold_frames,
-                args.switch_score_threshold,
-            )
-            pair = (
-                choose_two_person_pair(candidates, args.two_person_threshold)
-                if args.two_person_framing
-                else None
-            )
+            ball: Optional[Candidate] = None
+            if getattr(args, "sports_action", False):
+                subject, ball, pair = choose_sports_play(
+                    candidates,
+                    state,
+                    args,
+                    float(base_crop_w),
+                )
+            else:
+                subject = choose_subject(
+                    candidates,
+                    state,
+                    args.lock_first_subject,
+                    args.min_subject_hold_frames,
+                    args.switch_score_threshold,
+                )
+                pair = (
+                    choose_two_person_pair(candidates, args.two_person_threshold)
+                    if args.two_person_framing
+                    else None
+                )
+
+            if args.camera_mode == "locked":
+                intent = make_locked_intent(
+                    state.current_scene_index, subject, pair, candidates
+                )
+                for _ in range(analyze_stride):
+                    locked_intents.append(intent)
+                last_subject_key = update_locked_tracking_state(
+                    state,
+                    subject,
+                    pair,
+                    args,
+                    last_subject_key,
+                    stats,
+                )
+                if result_idx % 25 == 0:
+                    logging.info(
+                        "Analyzed %s/%s | scene=%s | tracked=%s | locked collect",
+                        frame_idx,
+                        total_frames if total_frames > 0 else "?",
+                        state.current_scene_index,
+                        state.tracked_id,
+                    )
+                continue
 
             if pair is not None:
                 stats["frames_with_two_person"] += 1
@@ -2013,14 +3364,27 @@ def process_video(args: argparse.Namespace) -> None:
                     state.lock_track_id = subject.track_id
                     state.lock_cls_id = subject.cls_id
 
-                observation = build_single_subject_observation(
-                    subject=subject,
-                    base_crop_w=base_crop_w,
-                    base_crop_h=base_crop_h,
-                    frame_w=frame_w,
-                    frame_h=frame_h,
-                    min_zoom=args.min_zoom,
-                    max_zoom=args.max_zoom,
+                observation = (
+                    build_action_observation(
+                        subject=subject,
+                        ball=ball,
+                        base_crop_w=base_crop_w,
+                        base_crop_h=base_crop_h,
+                        frame_w=frame_w,
+                        frame_h=frame_h,
+                        min_zoom=args.min_zoom,
+                        max_zoom=args.max_zoom,
+                    )
+                    if getattr(args, "sports_action", False)
+                    else build_single_subject_observation(
+                        subject=subject,
+                        base_crop_w=base_crop_w,
+                        base_crop_h=base_crop_h,
+                        frame_w=frame_w,
+                        frame_h=frame_h,
+                        min_zoom=args.min_zoom,
+                        max_zoom=args.max_zoom,
+                    )
                 )
 
                 subject_key = (subject.track_id, subject.cls_id)
@@ -2039,13 +3403,18 @@ def process_video(args: argparse.Namespace) -> None:
 
                 velocity_scale = clamp(observation.confidence, 0.0, 1.0)
                 observation.center_x = clamp(
-                    observation.center_x + state.framing_vx * velocity_scale * 0.8,
+                    observation.center_x
+                    + state.framing_vx
+                    * velocity_scale
+                    * float(getattr(args, "motion_lead_x", 0.8)),
                     0.0,
                     float(frame_w),
                 )
                 observation.center_y = clamp(
                     observation.center_y
-                    + state.framing_vy * velocity_scale * 0.45,
+                    + state.framing_vy
+                    * velocity_scale
+                    * float(getattr(args, "motion_lead_y", 0.45)),
                     0.0,
                     float(frame_h),
                 )
@@ -2075,14 +3444,18 @@ def process_video(args: argparse.Namespace) -> None:
                 state.missed_frames += 1
                 state.framing_vx *= 0.5
                 state.framing_vy *= 0.5
-                observation = build_global_saliency_observation(
-                    saliency_map=saliency_map,
-                    base_crop_w=base_crop_w,
-                    base_crop_h=base_crop_h,
-                    frame_w=frame_w,
-                    frame_h=frame_h,
-                    min_zoom=args.min_zoom,
-                    max_zoom=args.max_zoom,
+                observation = (
+                    build_global_saliency_observation(
+                        saliency_map=saliency_map,
+                        base_crop_w=base_crop_w,
+                        base_crop_h=base_crop_h,
+                        frame_w=frame_w,
+                        frame_h=frame_h,
+                        min_zoom=args.min_zoom,
+                        max_zoom=args.max_zoom,
+                    )
+                    if saliency_map is not None
+                    else None
                 )
 
                 if observation is not None:
@@ -2096,6 +3469,16 @@ def process_video(args: argparse.Namespace) -> None:
                         frame_h,
                     )
                 else:
+                    if state.force_hard_cut:
+                        # New scene with nothing to frame: cut to center now
+                        # rather than jumping mid-shot when a subject appears.
+                        state.crop_center_x = frame_w / 2
+                        state.crop_center_y = frame_h / 2
+                        state.target_center_x = frame_w / 2
+                        state.target_center_y = frame_h / 2
+                        state.zoom = args.min_zoom
+                        state.target_zoom = args.min_zoom
+                        state.force_hard_cut = False
                     crop_w, crop_h = current_crop_size(
                         base_crop_w, base_crop_h, state.zoom, frame_w, frame_h
                     )
@@ -2177,6 +3560,43 @@ def process_video(args: argparse.Namespace) -> None:
                     saliency_telemetry.get("requested_backend"),
                 )
 
+        if args.camera_mode == "locked":
+            if not locked_intents:
+                raise RuntimeError("Locked camera mode produced no frame plan")
+            if total_frames > 0:
+                locked_intents = locked_intents[:total_frames]
+            planned, locked_plan_info = plan_locked_camera_path(
+                locked_intents,
+                fps,
+                frame_w,
+                frame_h,
+                base_crop_w,
+                base_crop_h,
+                args,
+            )
+            logging.info(
+                "Locked camera plan: %s shots, %s hard cuts, %s seats, "
+                "%s two-shots, %s frames",
+                locked_plan_info["shots"],
+                locked_plan_info["cuts"],
+                locked_plan_info.get("seats", 0),
+                locked_plan_info.get("two_shots", 0),
+                len(planned),
+            )
+            render_locked_frames(
+                source_path,
+                planned,
+                writer,
+                debug_writer,
+                args,
+                base_crop_w,
+                base_crop_h,
+                frame_w,
+                frame_h,
+                total_frames,
+                stats,
+            )
+
         writer.release()
         if debug_writer is not None:
             debug_writer.release()
@@ -2187,7 +3607,7 @@ def process_video(args: argparse.Namespace) -> None:
 
         run_ffmpeg_mux(
             silent_video_path=str(silent_video_path),
-            source_input_path=str(input_path),
+            source_input_path=str(source_path),
             final_output_path=str(output_path),
             video_encoder=args.video_encoder,
             audio_bitrate=args.audio_bitrate,
@@ -2199,7 +3619,7 @@ def process_video(args: argparse.Namespace) -> None:
         if debug_writer is not None and final_debug_path is not None:
             run_ffmpeg_mux(
                 silent_video_path=str(debug_video_path),
-                source_input_path=str(input_path),
+                source_input_path=str(source_path),
                 final_output_path=str(final_debug_path),
                 video_encoder=args.video_encoder,
                 audio_bitrate=args.audio_bitrate,
@@ -2211,6 +3631,11 @@ def process_video(args: argparse.Namespace) -> None:
         saliency_telemetry = saliency_helper.get_telemetry()
         summary = {
             "preset": args.preset,
+            "camera_mode": args.camera_mode,
+            "locked_shots": locked_plan_info["shots"],
+            "locked_cuts": locked_plan_info["cuts"],
+            "locked_seats": locked_plan_info.get("seats", 0),
+            "locked_two_shots": locked_plan_info.get("two_shots", 0),
             "frames_processed": stats["frames_processed"],
             "scene_resets": stats["scene_resets"],
             "frames_with_subject": stats["frames_with_subject"],

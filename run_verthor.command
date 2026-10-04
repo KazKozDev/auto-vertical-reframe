@@ -59,7 +59,7 @@ APPLESCRIPT
 
 choose_preset() {
   osascript <<'APPLESCRIPT'
-set presetChoice to choose from list {"talking_head", "sports", "pets", "cars"} with prompt "Choose a framing preset" default items {"talking_head"}
+set presetChoice to choose from list {"talking_head", "sports", "pets", "cars", "movie"} with prompt "Choose a framing preset" default items {"talking_head"}
 if presetChoice is false then
   return ""
 end if
