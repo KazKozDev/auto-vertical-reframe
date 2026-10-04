@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "verthor"
 version = "0.1.0"
-description = "Scene-aware vertical auto-reframe CLI for video sources."
+description = "Auto-reframe CLI for vertical 9:16 video"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
