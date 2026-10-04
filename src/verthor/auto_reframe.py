@@ -197,6 +197,7 @@ class PersonHit:
     has_face: bool
     score: float
     box_width: float = 0.0
+    box_height: float = 0.0
 
 
 @dataclass
@@ -601,6 +602,11 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--seg-model", default="yolo11n-seg.pt")
     parser.add_argument("--tracker", default="bytetrack.yaml")
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="YOLO inference device (cpu, mps, 0, ...). Default: auto-select.",
+    )
     parser.add_argument("--conf", type=float, default=0.30)
 
     parser.add_argument(
@@ -701,6 +707,15 @@ def parse_args() -> argparse.Namespace:
             "width, treat the shot as a wide/title card and lock to center."
         ),
     )
+    parser.add_argument(
+        "--wide-person-height-frac",
+        type=float,
+        default=0.50,
+        help=(
+            "Locked mode: the wide/title-card rule only applies if the tallest "
+            "person is also shorter than this × frame height."
+        ),
+    )
 
     parser.add_argument("--max-step-x", type=float, default=None)
     parser.add_argument("--max-step-y", type=float, default=None)
@@ -710,7 +725,11 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--lock-first-subject", action="store_true")
 
-    parser.add_argument("--two-person-framing", action="store_true")
+    parser.add_argument(
+        "--two-person-framing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--two-person-threshold", type=float, default=None)
     parser.add_argument("--follow-deadzone-px", type=float, default=None)
     parser.add_argument("--motion-lead-x", type=float, default=None)
@@ -824,7 +843,7 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
         args.two_person_threshold = float(
             preset.get("two_person_threshold", 0.78)
         )
-    if not args.two_person_framing:
+    if args.two_person_framing is None:
         args.two_person_framing = bool(preset.get("two_person_framing", False))
     if args.follow_deadzone_px is None:
         args.follow_deadzone_px = float(preset.get("follow_deadzone_px", 0.0))
@@ -840,14 +859,17 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
     if args.face_stride is None:
         args.face_stride = int(preset.get("face_stride", 1))
     if args.saliency_model is None:
-        args.saliency_model = "off" if args.camera_mode == "locked" else "handcrafted"
+        args.saliency_model = (
+            "off"
+            if args.camera_mode == "locked" or args.fast
+            else "handcrafted"
+        )
 
     if args.fast:
         args.imgsz = min(int(args.imgsz), 512)
         if args.camera_mode == "locked":
             args.analyze_stride = max(int(args.analyze_stride), 2)
             args.face_stride = max(int(args.face_stride), 2)
-        args.saliency_model = "off"
 
     args.analyze_stride = max(1, int(args.analyze_stride))
     args.face_stride = max(1, int(args.face_stride))
@@ -925,6 +947,7 @@ class MediaPipeFaceHelper:
     ):
         self.stride = max(1, stride)
         self._cache: dict[int, Optional[tuple[int, int, int, int]]] = {}
+        self._cache_age: dict[int, int] = {}
         self.detector = None
         if mp_face_detection is None:
             logging.warning(
@@ -957,9 +980,10 @@ class MediaPipeFaceHelper:
         if (
             self.stride > 1
             and track_id is not None
-            and frame_idx % self.stride != 1
             and track_id in self._cache
+            and self._cache_age.get(track_id, 0) < self.stride - 1
         ):
+            self._cache_age[track_id] += 1
             return self._cache[track_id]
 
         h, w = frame_bgr.shape[:2]
@@ -977,12 +1001,10 @@ class MediaPipeFaceHelper:
         roi = roi[:upper_h, :]
         rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
         result = self.detector.process(rgb)
-        if not result.detections:
-            return None
 
         best = None
         best_area = -1.0
-        for det in result.detections:
+        for det in result.detections or []:
             bbox = det.location_data.relative_bounding_box
             fx1 = max(0.0, bbox.xmin)
             fy1 = max(0.0, bbox.ymin)
@@ -1000,10 +1022,12 @@ class MediaPipeFaceHelper:
                 best = (x1 + px1, y1 + py1, x1 + px2, y1 + py2)
         if track_id is not None:
             self._cache[track_id] = best
+            self._cache_age[track_id] = 0
         return best
 
     def reset_cache(self) -> None:
         self._cache.clear()
+        self._cache_age.clear()
 
 
 POSE_LANDMARK_NAMES = {
@@ -1903,6 +1927,7 @@ def person_hits_from_candidates(candidates: list[Candidate]) -> list[PersonHit]:
                 has_face=has_face,
                 score=max(candidate.score, candidate.conf),
                 box_width=max(1.0, candidate.width),
+                box_height=max(1.0, candidate.height),
             )
         )
     return hits
@@ -2040,7 +2065,13 @@ def _hits_at(intent: FrameIntent) -> list[PersonHit]:
     return []
 
 
-def _frame_lock_mode(intent: FrameIntent, frame_w: int, wide_frac: float) -> str:
+def _frame_lock_mode(
+    intent: FrameIntent,
+    frame_w: int,
+    frame_h: int,
+    wide_frac: float,
+    wide_height_frac: float,
+) -> str:
     if not intent.detections and intent.center_x is None:
         return "empty"
     if not intent.detections:
@@ -2048,7 +2079,8 @@ def _frame_lock_mode(intent: FrameIntent, frame_w: int, wide_frac: float) -> str
     widest = max((hit.box_width for hit in intent.detections), default=0.0)
     if widest <= 0:
         return "person"
-    if widest < frame_w * wide_frac:
+    tallest = max((hit.box_height for hit in intent.detections), default=0.0)
+    if widest < frame_w * wide_frac and tallest < frame_h * wide_height_frac:
         return "wide"
     return "person"
 
@@ -2139,6 +2171,7 @@ def plan_locked_camera_path(
     hold_near = crop_w * float(getattr(args, "hold_near_frac", 0.22))
     two_shot_fit = crop_w * float(getattr(args, "two_shot_fit_frac", 0.70))
     wide_frac = float(getattr(args, "wide_person_frac", 0.22))
+    wide_height_frac = float(getattr(args, "wide_person_height_frac", 0.50))
     win = max(0, int(round(0.2 * fps)))
     cluster_tol = max(16.0, crop_w * cluster_frac)
     seats = _build_scene_seats(intents, float(crop_w), cluster_frac)
@@ -2176,7 +2209,9 @@ def plan_locked_camera_path(
             last_cx = None
 
         assigned: Optional[int] = None
-        lock_mode = _frame_lock_mode(intent, frame_w, wide_frac)
+        lock_mode = _frame_lock_mode(
+            intent, frame_w, frame_h, wide_frac, wide_height_frac
+        )
         if lock_mode in {"empty", "wide"}:
             assigned = CENTER_SEAT
         elif intent.center_x is not None:
@@ -2902,23 +2937,19 @@ def extract_source_clip(
 ) -> None:
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg not found in PATH")
+    # Re-encode instead of stream copy: "-c copy" can only cut on keyframes,
+    # so the clip would start earlier than --start.
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
     if start > 0:
         cmd += ["-ss", f"{start:.3f}"]
     cmd += ["-i", str(input_path)]
     if duration is not None:
         cmd += ["-t", f"{duration:.3f}"]
-    cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero", str(output_path)]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if result.returncode == 0 and output_path.is_file() and output_path.stat().st_size > 0:
-        return
-    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
-    if start > 0:
-        cmd += ["-ss", f"{start:.3f}"]
-    cmd += ["-i", str(input_path)]
-    if duration is not None:
-        cmd += ["-t", f"{duration:.3f}"]
-    cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", "-c:a", "aac", str(output_path)]
+    cmd += [
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "12",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "256k",
+        str(output_path),
+    ]
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise RuntimeError(result.stderr or "Failed to extract source clip")
@@ -3057,11 +3088,7 @@ def process_video(args: argparse.Namespace) -> None:
 
     speaker_segments = load_speaker_segments(args.speaker_json)
 
-    yolo_device = 0 if torch is not None and torch.cuda.is_available() else (
-        "mps"
-        if torch is not None and torch.backends.mps.is_available()
-        else "cpu"
-    )
+    yolo_device = args.device or None
     logging.info(
         "Speed: model=%s imgsz=%s stride=%s face_stride=%s pose=%s "
         "saliency=%s masks=%s device=%s",
@@ -3072,7 +3099,7 @@ def process_video(args: argparse.Namespace) -> None:
         not args.skip_pose,
         args.saliency_model,
         args.retina_masks,
-        yolo_device,
+        yolo_device or "auto",
     )
     model = YOLO(args.seg_model)
     class_names = model.names
@@ -3442,6 +3469,16 @@ def process_video(args: argparse.Namespace) -> None:
                         frame_h,
                     )
                 else:
+                    if state.force_hard_cut:
+                        # New scene with nothing to frame: cut to center now
+                        # rather than jumping mid-shot when a subject appears.
+                        state.crop_center_x = frame_w / 2
+                        state.crop_center_y = frame_h / 2
+                        state.target_center_x = frame_w / 2
+                        state.target_center_y = frame_h / 2
+                        state.zoom = args.min_zoom
+                        state.target_zoom = args.min_zoom
+                        state.force_hard_cut = False
                     crop_w, crop_h = current_crop_size(
                         base_crop_w, base_crop_h, state.zoom, frame_w, frame_h
                     )
